@@ -6,15 +6,18 @@ use std::sync::{Arc, Mutex};
 
 use niri_config::{Config, OutputName};
 use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::egl::EGLDevice;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::{DebugFlags, ImportDma, ImportEgl, Renderer};
 use smithay::backend::winit::{self, WinitEvent, WinitGraphicsBackend};
+use smithay::input::pointer::CursorImageStatus;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::LoopHandle;
 use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use smithay::reexports::winit::dpi::LogicalSize;
 use smithay::reexports::winit::window::Window;
+use smithay::wayland::dmabuf::DmabufGlobal;
 use smithay::wayland::presentation::Refresh;
 
 use super::{IpcOutputMap, OutputId, RenderResult};
@@ -29,6 +32,7 @@ pub struct Winit {
     backend: WinitGraphicsBackend<GlesRenderer>,
     damage_tracker: OutputDamageTracker,
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
+    dmabuf_global: Option<DmabufGlobal>,
 }
 
 impl Winit {
@@ -132,6 +136,7 @@ impl Winit {
             backend,
             damage_tracker,
             ipc_outputs,
+            dmabuf_global: None,
         })
     }
 
@@ -139,6 +144,36 @@ impl Winit {
         let renderer = self.backend.renderer();
         if let Err(err) = renderer.bind_wl_display(&niri.display_handle) {
             warn!("error binding renderer wl_display: {err}");
+        }
+
+        use smithay::wayland::dmabuf::DmabufFeedbackBuilder;
+
+        let dmabuf_default_feedback =
+            EGLDevice::device_for_display(renderer.egl_context().display())
+                .ok()
+                .and_then(|x| x.try_get_render_node().ok().flatten())
+                .map(|node| {
+                    let dmabuf_formats = renderer.dmabuf_formats();
+                    DmabufFeedbackBuilder::new(node.dev_id(), dmabuf_formats)
+                        .build()
+                        .unwrap()
+                });
+
+        if let Some(default_feedback) = dmabuf_default_feedback {
+            self.dmabuf_global = Some(
+                niri.dmabuf_state
+                    .create_global_with_default_feedback::<State>(
+                        &niri.display_handle,
+                        &default_feedback,
+                    ),
+            );
+        } else {
+            warn!("failed to query render node, dmabuf will use v3");
+            let dmabuf_formats = renderer.dmabuf_formats();
+            self.dmabuf_global = Some(
+                niri.dmabuf_state
+                    .create_global::<State>(&niri.display_handle, dmabuf_formats),
+            );
         }
 
         resources::init(renderer);
@@ -175,11 +210,25 @@ impl Winit {
     pub fn render(&mut self, niri: &mut Niri, output: &Output) -> RenderResult {
         let _span = tracy_client::span!("Winit::render");
 
+        let window = self.backend.window();
+
+        // https://github.com/YaLTeR/niri/pull/1068
+        let include_pointer = if let (CursorImageStatus::Named(cursor_icon), None) =
+            (niri.cursor_manager.cursor_image(), niri.dnd_icon.as_ref())
+        {
+            window.set_cursor(*cursor_icon);
+            window.set_cursor_visible(true);
+            false
+        } else {
+            window.set_cursor_visible(false);
+            true
+        };
+
         // Render the elements.
         let mut elements = niri.render::<GlesRenderer>(
             self.backend.renderer(),
             output,
-            true,
+            include_pointer,
             RenderTarget::Output,
         );
 
